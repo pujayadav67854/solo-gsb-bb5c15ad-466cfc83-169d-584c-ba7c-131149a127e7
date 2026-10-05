@@ -4,12 +4,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
 from .config import Settings
@@ -24,6 +26,7 @@ from .imaging import (
 from .models import (
     AnnotationsPut,
     BatchPublishRequest,
+    PackageRequest,
     PublishRequest,
     WithdrawRequest,
 )
@@ -32,6 +35,10 @@ MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg"}
 
 # 定时公开的最大提前量：首次提交时公开时间不得晚于当前时刻 30 天
 MAX_PUBLISH_DELAY = timedelta(days=30)
+
+# 离线交付包"资格确认完毕（仍在写锁/写事务内）-> 读盘打包"之间的钩子。
+# 生产中为空操作；并发测试借此在资格确认后插入撤回，验证串行顺序。
+PACKAGE_ELIGIBILITY_HOOK: Any = None
 
 
 def _utcnow() -> str:
@@ -140,6 +147,14 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _cleanup_tempfile(path: str) -> None:
+    """流式响应结束后删除临时 ZIP；任何失败都不影响已完成的交付。"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _error(status: int, code: str, message: str, **extra: Any) -> None:
     detail = {"code": code, "message": message}
     detail.update(extra)
@@ -202,8 +217,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _error(404, "document_not_found", f"document '{doc_id}' does not exist")
         return row
 
-    def _get_publication(conn: Any, doc_id: str, version: int) -> Any:
-        """取发布记录；未知文档/版本按既有的不存在错误返回。"""
+    def _get_publication(
+        conn: Any,
+        doc_id: str,
+        version: int,
+        position: int | None = None,
+    ) -> Any:
+        """取发布记录；未知文档/版本按既有的不存在错误返回。
+
+        离线交付包场景传入 ``position`` 时在错误体上附请求下标，
+        使整包拒绝的原因可以定位到具体条目；不附任何成品或遮盖详情。
+        """
         pub = conn.execute(
             "SELECT * FROM publications WHERE doc_id = ? AND version = ?",
             (doc_id, version),
@@ -212,18 +236,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             exists = conn.execute(
                 "SELECT 1 FROM documents WHERE id = ?", (doc_id,)
             ).fetchone()
+            extra = {"version": version}
+            if position is not None:
+                extra["position"] = position
             if exists is None:
                 _error(
-                    404, "document_not_found", f"document '{doc_id}' does not exist"
+                    404,
+                    "document_not_found",
+                    f"document '{doc_id}' does not exist",
+                    doc_id=doc_id,
+                    **extra,
                 )
             _error(
                 404,
                 "unknown_version",
                 f"document '{doc_id}' has no publication version {version}",
+                doc_id=doc_id,
+                **extra,
             )
         return pub
 
-    def _ensure_not_withdrawn(conn: Any, doc_id: str, version: int) -> None:
+    def _ensure_not_withdrawn(
+        conn: Any,
+        doc_id: str,
+        version: int,
+        position: int | None = None,
+    ) -> None:
         """已撤回版本对公开面不可见（410），不返回成品与遮盖详情。
 
         撤回只登记记录、不删除成品文件：生效前已开始的下载因此能够
@@ -235,14 +273,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             (doc_id, version),
         ).fetchone()
         if row is not None:
+            extra: dict[str, Any] = {"doc_id": doc_id, "version": version}
+            if position is not None:
+                extra["position"] = position
             _error(
                 410,
                 "publication_withdrawn",
                 f"document '{doc_id}' publication version {version} has been"
                 " withdrawn and is no longer publicly available",
+                **extra,
             )
 
-    def _ensure_publish_time_reached(pub: Any) -> None:
+    def _ensure_publish_time_reached(
+        pub: Any, position: int | None = None
+    ) -> None:
         """未到公开时间的版本对公开面表现为 404（与未知版本一致）。
 
         既不返回成品，也不返回遮盖坐标/原因、摘要等任何版本信息；
@@ -253,10 +297,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if publish_at is not None and _stored_publish_at_dt(
             publish_at
         ) > _now_dt():
+            extra: dict[str, Any] = {
+                "doc_id": pub["doc_id"],
+                "version": pub["version"],
+            }
+            if position is not None:
+                extra["position"] = position
             _error(
                 404,
                 "publication_not_yet_public",
                 f"publication is scheduled to become public at {publish_at}",
+                **extra,
             )
 
     # ---------------- 基本 ----------------
@@ -937,6 +988,155 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             path,
             media_type="image/png",
             filename=f"{doc_id}-v{version}.png",
+        )
+
+    # ---------------- 离线交付包（ZIP：各版 PNG + JSON 清单） ----------------
+
+    @app.post("/publication-packages")
+    def create_publication_package(
+        body: PackageRequest,
+        background_tasks: BackgroundTasks,
+    ) -> FileResponse:
+        """按请求顺序把 2～20 个互不重复的已公开脱敏版本打成 ZIP。
+
+        资格确认（数量/重复、未知文档版本、撤回、公开时间）与撤回操作
+        通过同一个 ``BEGIN IMMEDIATE`` 写锁串行：撤回先提交则本次整包
+        拒绝，打包先确认则撤回被挡到事务提交之后，本次交付照常完成。
+        任一资格项失败都不读取任何成品、不产出部分包；读盘/校验/打包
+        过程中的任何失败同样不交付。包内 PNG 文件名只由请求位置、
+        服务端文档 ID 与版本号生成，绝不取自上传文件名。
+        """
+        items = body.items
+
+        # 结构性校验在事务外完成：数量与重复本身不泄露任何版本信息。
+        if not 2 <= len(items) <= 20:
+            _error(
+                400,
+                "invalid_package_size",
+                f"package must contain between 2 and 20 items, got {len(items)}",
+                count=len(items),
+            )
+        seen: set[tuple[str, int]] = set()
+        for pos, item in enumerate(items):
+            key = (item.doc_id, item.version)
+            if key in seen:
+                _error(
+                    400,
+                    "duplicate_item_in_package",
+                    f"document '{item.doc_id}' version {item.version} appears more"
+                    " than once in the package request",
+                    position=pos,
+                    doc_id=item.doc_id,
+                    version=item.version,
+                )
+            seen.add(key)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="pub-pkg-", suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            # 资格确认 + 全部成品读盘/摘要校验 + ZIP 生成同在一个写事务内：
+            # 与撤回（以及发布、标注修改）互斥串行，确认结果与包内容一致。
+            with write_tx(settings.db_path) as conn:
+                # 第一阶段：按请求顺序逐项资格确认，全部通过后才读任何成品。
+                qualified: list[tuple[int, Any]] = []
+                for pos, item in enumerate(items):
+                    pub = _get_publication(
+                        conn, item.doc_id, item.version, position=pos
+                    )
+                    # 永久撤回优先于公开时间（与单份公开读取的顺序一致）
+                    _ensure_not_withdrawn(
+                        conn, item.doc_id, item.version, position=pos
+                    )
+                    _ensure_publish_time_reached(pub, position=pos)
+                    qualified.append((pos, pub))
+
+                # 资格已在写锁内确认：并发撤回此刻无法生效，须等本事务提交。
+                if PACKAGE_ELIGIBILITY_HOOK is not None:
+                    PACKAGE_ELIGIBILITY_HOOK()
+
+                # 第二阶段：逐项读盘并复算成品摘要；任何缺失/IO 失败/摘要
+                # 不符都整包拒绝（不交付部分包）。先全部读入再写 ZIP，
+                # 保证 ZIP 中绝不残留失败项。
+                loaded: list[tuple[int, Any, bytes, str]] = []
+                for pos, pub in qualified:
+                    path = pub["output_path"]
+                    if not os.path.exists(path):
+                        _error(
+                            500,
+                            "artifact_missing",
+                            f"published artifact for document '{pub['doc_id']}'"
+                            f" version {pub['version']} is missing on disk",
+                            position=pos,
+                            doc_id=pub["doc_id"],
+                            version=pub["version"],
+                        )
+                    try:
+                        with open(path, "rb") as f:
+                            artifact = f.read()
+                    except OSError as exc:
+                        _error(
+                            500,
+                            "artifact_read_failed",
+                            f"failed to read published artifact for document"
+                            f" '{pub['doc_id']}' version {pub['version']}: {exc}",
+                            position=pos,
+                            doc_id=pub["doc_id"],
+                            version=pub["version"],
+                        )
+                    actual_sha = _sha256_bytes(artifact)
+                    if actual_sha != pub["output_sha256"]:
+                        _error(
+                            500,
+                            "artifact_corrupt",
+                            f"published artifact for document '{pub['doc_id']}'"
+                            f" version {pub['version']} failed integrity check",
+                            position=pos,
+                            doc_id=pub["doc_id"],
+                            version=pub["version"],
+                        )
+                    rect_count = conn.execute(
+                        "SELECT COUNT(*) AS c FROM annotation_rects"
+                        " WHERE doc_id = ? AND revision = ?",
+                        (pub["doc_id"], pub["annotation_revision"]),
+                    ).fetchone()["c"]
+                    loaded.append((pos, pub, artifact, actual_sha, rect_count))
+
+                # 第三阶段：生成 ZIP。包内文件名只用请求位置 + 服务端文档 ID
+                # + 版本号，绝不取自上传文件名。
+                manifest_entries: list[dict] = []
+                created_at = _utcnow()
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for pos, pub, artifact, actual_sha, rect_count in loaded:
+                        arcname = f"{pos + 1:02d}_{pub['doc_id']}_v{pub['version']}.png"
+                        zf.writestr(arcname, artifact)
+                        manifest_entries.append(
+                            {
+                                "position": pos,
+                                "doc_id": pub["doc_id"],
+                                "version": pub["version"],
+                                "output_sha256": actual_sha,
+                                "redaction_count": rect_count,
+                                "file": arcname,
+                            }
+                        )
+                    manifest = {
+                        "created_at": created_at,
+                        "count": len(manifest_entries),
+                        "items": manifest_entries,  # 顺序与请求一致
+                    }
+                    zf.writestr(
+                        "manifest.json",
+                        json.dumps(manifest, ensure_ascii=False, indent=2),
+                    )
+            # 事务已提交：本次交付资格锁定，即使撤回此刻生效也照常完成。
+        except Exception:
+            _cleanup_tempfile(tmp_path)
+            raise
+        background_tasks.add_task(_cleanup_tempfile, tmp_path)
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename="publication-package.zip",
         )
 
     return app

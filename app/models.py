@@ -58,3 +58,19 @@ class WithdrawRequest(BaseModel):
     """
 
     reason: str = Field(max_length=500)
+
+
+class PackageItem(BaseModel):
+    """离线交付包中的一项：文档 ID 与已发布版本号（无需标注修订号）。"""
+
+    doc_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+
+
+class PackageRequest(BaseModel):
+    """离线交付包请求：按请求顺序列出 2～20 个互不重复的 (doc_id, version)。
+
+    数量、重复等语义校验在路由内完成，以返回统一格式的业务错误码。
+    """
+
+    items: list[PackageItem] = Field(default_factory=list)

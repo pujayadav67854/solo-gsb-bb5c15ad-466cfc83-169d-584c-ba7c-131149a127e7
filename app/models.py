@@ -58,3 +58,24 @@ class WithdrawRequest(BaseModel):
     """
 
     reason: str = Field(max_length=500)
+
+
+class DeliveryItem(BaseModel):
+    """离线交付包中的一项：文档 ID 与已发布版本号。
+
+    版本号不加下界约束：0 或负数在库中本就不存在，由路由统一按
+    未知版本（404 unknown_version）处理，与公开读取契约保持一致。
+    """
+
+    doc_id: str = Field(min_length=1, max_length=64)
+    version: int
+
+
+class DeliveryPackageRequest(BaseModel):
+    """离线交付请求：按请求顺序给出 2～20 个 (doc_id, version)，互不重复。
+
+    数量范围、重复项以及各项"已公开且未撤回"的资格校验在路由内完成，
+    以返回统一格式的业务错误码；任一项不满足即整包拒绝。
+    """
+
+    items: list[DeliveryItem] = Field(default_factory=list)

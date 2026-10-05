@@ -7,7 +7,11 @@
 指定统一的 **UTC 公开时间**：到点前公开版详情与图片一律 404，到点后自动
 可读；省略时仍立即公开。已发布版本发现遮盖遗漏时，
 可凭文档 ID、版本号与非空原因**永久撤回**：公开读取立即拒绝（优先于公开
-时间），发布记录、成品文件与版本号序列全部保留。
+时间），发布记录、成品文件与版本号序列全部保留。档案员还可按请求顺序把
+**2～20 个互不重复的已公开版本**（文档 ID + 版本号）打成一个 **ZIP 离线
+交付包**：包内为各版脱敏 PNG 与按请求顺序记录的 JSON 清单（文档 ID、
+版本号、成品 SHA-256、遮盖数、包内文件名）；任一项未知、未到公开时间或
+已撤回即整包拒绝且不泄露该项成品或遮盖详情。
 
 技术栈：Python 3.11+ · FastAPI · Pillow · SQLite（WAL）
 
@@ -63,6 +67,7 @@ python -m pytest tests/ -q
 | GET  | `/publication-batches/{batch_id}` | 按批次标识查询清单（顺序与请求一致，含公开时间、撤回状态） |
 | GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因（未到公开时间 404） |
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG（未到公开时间 404） |
+| POST | `/delivery-packages` | **离线交付包**：按请求顺序给 2～20 个互不重复的 `(doc_id, version)`，整包返回 ZIP（`images/*.png` + `manifest.json`）；任一项未知/未到公开时间/已撤回或成品缺失即整包拒绝 |
 
 ## 调用示例（curl）
 
@@ -110,8 +115,9 @@ curl -s $BASE/documents/$DOC_ID/publications   # v1 条目 withdrawn=true
 
 完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
 （批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）、
-`examples/demo_scheduled_publication.sh`（定时公开流程）与
-`examples/demo_withdrawal.sh`（版本撤回流程）；
+`examples/demo_scheduled_publication.sh`（定时公开流程）、
+`examples/demo_withdrawal.sh`（版本撤回流程）与
+`examples/demo_delivery.sh`（离线交付包流程）；
 先启动服务，再执行 `bash examples/demo_scheduled_publication.sh`。
 
 ## 定时公开（统一 UTC 公开时间 `publish_at`）
@@ -330,6 +336,116 @@ curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
 端到端示例：`bash examples/demo_withdrawal.sh`。
 
 
+## 离线交付包（多份已公开脱敏版整包 ZIP）
+
+档案员要把多份**已公开的脱敏版本**一次性交给离线接收方时，调用
+`POST /delivery-packages`，请求体按顺序给出 **2～20 个互不重复**的
+`(doc_id, version)`：
+
+```json
+{
+  "items": [
+    {"doc_id": "DOC_ID_2", "version": 1},
+    {"doc_id": "DOC_ID_1", "version": 3},
+    {"doc_id": "DOC_ID_1", "version": 1}
+  ]
+}
+```
+
+- “互不重复”以 **(文档 ID, 版本号) 对**判定：同一文档的不同版本可以同包；
+  仅当同一对出现两次才报 `400 duplicate_delivery_item`
+  （附 `position`/`doc_id`/`version`）。数量不在 2～20 报
+  `400 invalid_delivery_size`（附 `count`）。
+
+成功返回 `200 application/zip`
+（`Content-Disposition: attachment; filename="delivery-package.zip"`），
+ZIP 结构：
+
+```
+delivery-package.zip
+├── manifest.json                         # JSON 清单
+└── images/
+    ├── 71ee062d…-v1.png                  # 各版脱敏 PNG
+    ├── 8d50308b…-v3.png
+    └── db5c4ca6…-v1.png
+```
+
+`manifest.json` **按请求顺序**记录每一项的文档 ID、版本号、成品 SHA-256、
+遮盖数及包内文件名：
+
+```json
+{
+  "count": 3,
+  "items": [
+    {"position": 0, "doc_id": "71ee062d…", "version": 1,
+     "output_sha256": "c470f344…", "redaction_count": 2,
+     "filename": "images/71ee062d…-v1.png"},
+    {"position": 1, "doc_id": "8d50308b…", "version": 3,
+     "output_sha256": "…", "redaction_count": 1,
+     "filename": "images/8d50308b…-v3.png"}
+  ],
+  "created_at": "2026-10-05T16:16:05+00:00"
+}
+```
+
+关键约定：
+
+- **包内文件名不取自上传文件名**：一律由服务端生成为
+  `images/{doc_id}-v{version}.png`（文档 ID 为服务端分配的 32 位十六进制，
+  不存在路径穿越），互不重复；上传时的原始文件名不会进入包内。
+- **成品 SHA-256** 是打包时对包内 PNG 重新计算的值（与发布记录
+  `output_sha256` 一致；不一致按成品损坏处理）。**遮盖数**取该版本发布时
+  固化的标注修订下的矩形数量，后续改标注不影响已发布版本。
+- **整包拒绝、不泄露详情**：逐项资格校验与公开读取契约完全一致——未知文档
+  `404 document_not_found`、未知版本 `404 unknown_version`、未到公开时间
+  `404 publication_not_yet_public`、已撤回 `410 publication_withdrawn`
+  （撤回优先于公开时间，到点也不恢复）。任一项命中即整个请求返回该错误
+  （附首项失败的 `position`/`doc_id`/`version`），**不返回 ZIP**，错误中也
+  不含任何一项的成品字节、摘要或遮盖坐标/原因；其余合格项的成品同样不出现在
+  响应中。
+- **资格确认与撤回串行**：全部资格确认与撤回都在 `BEGIN IMMEDIATE` 写事务内
+  经 SQLite 写锁串行化——撤回先提交则本次打包在资格确认处 410 拒绝；打包先
+  确认资格则本次交付允许完成（撤回在锁上排队，事务提交后才生效），与
+  “撤回生效前已开始的下载允许完成”的既有语义一致。撤回不删除成品文件，
+  排队等待也无法影响已确认交付的包内文件。
+- **成品缺失/读盘失败不交付部分包**：任一成品不在磁盘
+  （`500 artifact_missing`）、无法读取（`500 artifact_read_failed`）或与
+  记录摘要不符（`500 artifact_corrupted`）都整体报错，响应不是 ZIP，
+  接收方不会拿到缺项的部分包。
+- **只读、兼容**：交付不写任何记录、不占用版本号、不改动成品与发布/撤回
+  状态；既有发布、撤回与公开读取契约及启动方式完全不变。
+
+调用示例（curl）：
+
+```bash
+BASE=http://localhost:8000
+
+# 申请交付包并保存为 ZIP
+curl -sS -X POST "$BASE/delivery-packages" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"doc_id": "71ee062dfef144c5ba187da994c7ad7b", "version": 1},
+      {"doc_id": "8d50308b38004483b357f2620ace6a3c", "version": 3}
+    ]
+  }' -o delivery-package.zip
+
+# 用 Python 标准库解包并逐项核对成品 SHA-256
+python3 - <<'EOF'
+import hashlib, json, zipfile
+with zipfile.ZipFile("delivery-package.zip") as zf:
+    manifest = json.loads(zf.read("manifest.json"))
+    for it in manifest["items"]:
+        data = zf.read(it["filename"])
+        assert hashlib.sha256(data).hexdigest() == it["output_sha256"]
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+EOF
+```
+
+端到端示例（含清单校验、撤回后整包拒绝、数量/重复/未知版本报错）：
+`bash examples/demo_delivery.sh`。
+
+
 ## 错误响应
 
 统一格式：`{"detail": {"code": "...", "message": "..."}}`
@@ -353,6 +469,12 @@ curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
 | 409 | `idempotency_key_conflict` | 幂等键已用于不同内容的批次请求（原批次不受影响） |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
+| 400 | `invalid_delivery_size` | 离线交付包条目数不在 2～20（附 `count`） |
+| 400 | `duplicate_delivery_item` | 交付请求中同一 `(doc_id, version)` 重复（附 `position`/`doc_id`/`version`） |
+| 500 | `artifact_missing` | 交付项成品在磁盘上缺失（附 `position`/`doc_id`/`version`），不交付部分包 |
+| 500 | `artifact_read_failed` | 交付项成品无法读盘（附 `position`/`doc_id`/`version`），不交付部分包 |
+| 500 | `artifact_corrupted` | 交付项成品摘要与发布记录不符（附 `position`/`doc_id`/`version`），不交付部分包 |
+| 500 | `package_assembly_failed` | 防御性错误：文档 ID 不满足包内文件名安全约束（正常数据不可达） |
 | 413 | `payload_too_large` | 超过上传大小上限 |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
 
@@ -399,6 +521,15 @@ curl -sS -X POST $BASE/documents/$DOC_ID/publications/1/withdraw \
 - **公开面**：`/publications/...` 只返回发布版成品、遮盖坐标与原因及摘要值，
   原图没有任何对外读取入口；未到公开时间的版本返回 404（不返回成品、遮盖
   详情与摘要），已撤回版本返回 410。
+- **离线交付包**：数量范围（2～20）与重复 `(doc_id, version)` 检查先于一切
+  资格校验与成品读取；之后在**一个** `BEGIN IMMEDIATE` 写事务内按请求顺序完成
+  存在性 → 撤回（410 优先）→ 公开时间（404）的资格确认，全部通过后才逐项
+  读盘、重算 SHA-256（缺失/读失败/摘要不符即 500），并在内存中组装 ZIP。
+  写锁使资格确认与撤回严格串行：撤回先提交则整包 410，打包先确认则本次交付
+  完成、排队的撤回提交后再生效。任一失败都不返回 ZIP（无部分包），错误仅附
+  `position`/`doc_id`/`version` 定位，不含成品字节、摘要与遮盖详情。交付全程
+  只读，不新增记录、不占版本号；包内文件名 `images/{doc_id}-v{version}.png`
+  由服务端生成，与上传文件名无关。
 
 ## 目录结构
 
@@ -419,15 +550,41 @@ tests/test_withdrawal.py   # 10 个用例：撤回/查询、公开读取 410、�
 tests/test_scheduled_publication.py  # 22 个用例：单份/批次定时发布、到点前后
                                      #   404→200、不可变、无效时间不留痕、时区
                                      #   规范化、幂等内容纳入公开时间、撤回优先
+tests/test_delivery.py      # 23 个用例：交付包清单顺序/摘要/遮盖数、包内文件名、
+                            #   数量与重复、未知/未到点/撤回整包拒绝且不泄露、
+                            #   成品缺失/读失败/损坏不交付部分包、资格确认与撤回
+                            #   串行（先确认完成 vs 先生效拒绝）、并发压力、只读兼容
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
 examples/demo_scheduled_publication.sh  # 定时公开端到端 curl 示例
 examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
+examples/demo_delivery.sh    # 离线交付包端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（定时公开 publish_at）
+## 本轮变动（离线交付包）
+
+- 新增 `POST /delivery-packages`：请求体 `{"items":[{"doc_id","version"},…]}`，
+  按请求顺序接收 2～20 个互不重复的 `(doc_id, version)`，成功返回
+  `200 application/zip`：`images/{doc_id}-v{version}.png` 各版脱敏 PNG 加
+  `manifest.json` 清单（按请求顺序记录文档 ID、版本号、成品 SHA-256、遮盖数、
+  包内文件名）。包内文件名全部由服务端生成，不取自上传文件名。
+- 资格语义与公开读取契约一致：未知文档 `404 document_not_found`、未知版本
+  `404 unknown_version`、未到公开时间 `404 publication_not_yet_public`、已撤回
+  `410 publication_withdrawn`（撤回优先，到点不恢复）；数量越界
+  `400 invalid_delivery_size`、重复对 `400 duplicate_delivery_item`。
+  任一项命中即**整包拒绝**：不返回 ZIP，错误不含任何一项的成品、摘要或遮盖
+  详情（仅附首项失败的 `position`/`doc_id`/`version`），也不交付其余合格项。
+- 资格确认与撤回在同一个 `BEGIN IMMEDIATE` 写事务内经 SQLite 写锁**串行**：
+  撤回先生效则拒绝，打包先确认则允许本次交付完成、排队的撤回在包事务提交后
+  生效；成品缺失/读盘失败/与记录摘要不符（`artifact_missing`/
+  `artifact_read_failed`/`artifact_corrupted`）同样整包拒绝，不产生部分包。
+- 交付为只读操作：不新增表或列、不写记录、不占版本号、不改动成品；上传、
+  标注、单份/批次发布、撤回、公开读取等既有路由、请求与响应字段及启动方式
+  （Dockerfile / docker-compose.yml / uvicorn 命令）均未改动，行为完全兼容。
+
+## 历史变动（定时公开 publish_at）
 
 - 单份发布 `POST /documents/{doc_id}/publish` 新增**可选 JSON 请求体**
   `{"publish_at": "RFC3339 时间"}`（省略请求体的既有调用方式不变）；
